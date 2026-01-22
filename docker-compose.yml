@@ -1,0 +1,18 @@
+services:
+  argonath:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8082:8081"
+    environment:
+      - ANTHROPIC_API_URL=https://api.anthropic.com
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alpha-pi:4318
+      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+      - OTEL_SERVICE_NAME=argonath
+    restart: unless-stopped
+    dns:
+      - ${TAILSCALE_DNS}
+      - ${PUBLIC_DNS}
+    dns_search:
+      - ${TAILSCALE_SEARCH}
