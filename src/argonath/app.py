@@ -247,24 +247,21 @@ async def handle_request(request: Request, path: str):
 
     logger.info(f"Processing: model={model_name}, session={session_id[:8] if session_id else 'none'}")
 
-    # === Create the LLM span (goes to Phoenix via openinference.span.kind) ===
+    # === Create the LLM span with gen_ai.* conventions ===
+    # Span name: "{gen_ai.operation.name} {gen_ai.request.model}"
     llm_span = tracer.start_span(
-        name=f"llm.{model_name}",
+        name=f"chat {model_name}",
         kind=otel_trace.SpanKind.CLIENT,
         start_time=start_time_ns,
         # Parent to current context (wrapper_span)
     )
 
     try:
-        # Set request attributes on LLM span
+        # Set request attributes on LLM span (pass session_id for gen_ai.conversation.id)
         if request_body:
-            req_attrs = request_attributes(request_body)
+            req_attrs = request_attributes(request_body, session_id=session_id)
             for key, value in req_attrs.items():
                 llm_span.set_attribute(key, value)
-
-        # Session correlation
-        if session_id:
-            llm_span.set_attribute("session.id", session_id)
 
         # === Forward to Anthropic ===
         client = await get_client()

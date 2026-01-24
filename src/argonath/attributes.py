@@ -1,119 +1,239 @@
-"""OpenInference attribute extraction from Anthropic API requests/responses.
+"""gen_ai.* attribute extraction from Anthropic API requests/responses.
 
-Preserves the full structure of content arrays for proper Phoenix display.
+Follows OpenTelemetry Semantic Conventions for GenAI:
+https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md
+
+Key design decisions:
+- System prompt goes in gen_ai.system_instructions (separate from input.messages)
+- gen_ai.input.messages contains the current TURN only (from last user text message onward)
+- Turn boundary = user message with text content (not tool_result)
 """
 
 import json
 from typing import Any
 
 
-def request_attributes(body: dict[str, Any]) -> dict[str, Any]:
-    """Extract OpenInference attributes from an Anthropic Messages API request.
-
-    Preserves content array structure using indexed attribute names.
-    System prompt becomes message index 0, conversation messages follow.
-    """
+def request_attributes(body: dict[str, Any], session_id: str | None = None) -> dict[str, Any]:
+    """Extract gen_ai.* attributes from an Anthropic Messages API request."""
     attrs: dict[str, Any] = {}
 
-    # === Core LLM attributes ===
     model = body.get("model", "unknown")
-    attrs["openinference.span.kind"] = "LLM"
-    attrs["llm.system"] = "anthropic"
-    attrs["llm.model_name"] = model
 
-    # gen_ai.* for compatibility
-    attrs["gen_ai.system"] = "anthropic"
+    # === Required attributes ===
+    attrs["gen_ai.operation.name"] = "chat"
+    attrs["gen_ai.provider.name"] = "anthropic"
     attrs["gen_ai.request.model"] = model
 
-    # === Invocation parameters ===
-    attrs["llm.invocation_parameters"] = json.dumps({
-        "max_tokens": body.get("max_tokens", 0),
-        "temperature": body.get("temperature", 1.0),
-        "stream": body.get("stream", False),
-    })
+    # === Conditionally required ===
+    if session_id:
+        attrs["gen_ai.conversation.id"] = session_id
 
-    # === Input messages ===
-    msg_idx = 0
+    # === Recommended request parameters ===
+    if "max_tokens" in body:
+        attrs["gen_ai.request.max_tokens"] = body["max_tokens"]
+    if "temperature" in body:
+        attrs["gen_ai.request.temperature"] = body["temperature"]
+    if "top_p" in body:
+        attrs["gen_ai.request.top_p"] = body["top_p"]
+    if "top_k" in body:
+        attrs["gen_ai.request.top_k"] = body["top_k"]
+    if "stop_sequences" in body:
+        attrs["gen_ai.request.stop_sequences"] = body["stop_sequences"]
 
-    # System prompt first (index 0)
+    # === System instructions (separate from input.messages) ===
     system = body.get("system")
     if system:
-        attrs[f"llm.input_messages.{msg_idx}.message.role"] = "system"
-        if isinstance(system, str):
-            attrs[f"llm.input_messages.{msg_idx}.message.content"] = system
-        elif isinstance(system, list):
-            # System prompt with content array (cache_control blocks, etc.)
-            _add_content_array(attrs, f"llm.input_messages.{msg_idx}.message", system)
-        msg_idx += 1
+        attrs["gen_ai.system_instructions"] = _format_system_instructions(system)
 
-    # Conversation messages
-    for msg in body.get("messages", []):
-        role = msg.get("role", "unknown")
-        content = msg.get("content")
-        prefix = f"llm.input_messages.{msg_idx}.message"
-
-        attrs[f"{prefix}.role"] = role
-
-        if isinstance(content, str):
-            attrs[f"{prefix}.content"] = content
-        elif isinstance(content, list):
-            _add_content_array(attrs, prefix, content)
-
-        msg_idx += 1
-
-    # === Tools (if provided) ===
-    tools = body.get("tools", [])
-    for tool_idx, tool in enumerate(tools):
-        prefix = f"llm.tools.{tool_idx}.tool"
-        attrs[f"{prefix}.json_schema"] = json.dumps(tool)
-        if "name" in tool:
-            attrs[f"{prefix}.name"] = tool["name"]
-        if "description" in tool:
-            attrs[f"{prefix}.description"] = tool.get("description", "")
-
-    # === input.value for Phoenix UI (last real user message) ===
-    last_user_text = _find_last_user_text(body.get("messages", []))
-    if last_user_text:
-        attrs["input.value"] = last_user_text[:2000]
-        attrs["input.mime_type"] = "text/plain"
+    # === Input messages (current turn only) ===
+    messages = body.get("messages", [])
+    turn_messages = _extract_current_turn(messages)
+    if turn_messages:
+        attrs["gen_ai.input.messages"] = _format_input_messages(turn_messages)
 
     return attrs
 
 
 def response_attributes(body: dict[str, Any]) -> dict[str, Any]:
-    """Extract OpenInference attributes from an Anthropic Messages API response."""
+    """Extract gen_ai.* attributes from an Anthropic Messages API response."""
     attrs: dict[str, Any] = {}
 
-    # === Token counts ===
+    # === Usage ===
     usage = body.get("usage", {})
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
 
-    attrs["llm.token_count.prompt"] = input_tokens
-    attrs["llm.token_count.completion"] = output_tokens
-    attrs["llm.token_count.total"] = input_tokens + output_tokens
+    if input_tokens:
+        attrs["gen_ai.usage.input_tokens"] = input_tokens
+    if output_tokens:
+        attrs["gen_ai.usage.output_tokens"] = output_tokens
 
-    # gen_ai.* for compatibility
-    attrs["gen_ai.usage.input_tokens"] = input_tokens
-    attrs["gen_ai.usage.output_tokens"] = output_tokens
+    # === Response metadata ===
+    if "id" in body:
+        attrs["gen_ai.response.id"] = body["id"]
+    if "model" in body:
+        attrs["gen_ai.response.model"] = body["model"]
 
-    # Cache metrics (Anthropic-specific)
-    cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_write = usage.get("cache_creation_input_tokens", 0)
-    if cache_read:
-        attrs["llm.token_count.prompt_details.cache_read"] = cache_read
-    if cache_write:
-        attrs["llm.token_count.prompt_details.cache_write"] = cache_write
+    # === Finish reason ===
+    stop_reason = body.get("stop_reason")
+    if stop_reason:
+        attrs["gen_ai.response.finish_reasons"] = [stop_reason]
 
-    # === Output message ===
+    # === Output type ===
     content_blocks = body.get("content", [])
-    prefix = "llm.output_messages.0.message"
+    has_text = any(b.get("type") == "text" for b in content_blocks if isinstance(b, dict))
+    has_tool = any(b.get("type") == "tool_use" for b in content_blocks if isinstance(b, dict))
 
-    attrs[f"{prefix}.role"] = "assistant"
+    if has_tool:
+        attrs["gen_ai.output.type"] = "json"  # Tool calls are structured
+    elif has_text:
+        attrs["gen_ai.output.type"] = "text"
 
-    # Separate text content from tool calls
-    text_parts = []
-    tool_call_idx = 0
+    # === Output messages ===
+    if content_blocks:
+        attrs["gen_ai.output.messages"] = _format_output_messages(content_blocks, stop_reason)
+
+    return attrs
+
+
+def _extract_current_turn(messages: list) -> list:
+    """Extract the current turn from the message history.
+
+    A turn starts with a user TEXT message (not just tool_result).
+    Returns everything from that message to the end.
+    """
+    turn_start_idx = None
+
+    # Scan backwards to find the last user text message
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") != "user":
+            continue
+
+        content = msg.get("content")
+
+        # Plain text message
+        if isinstance(content, str):
+            # Skip hook-injected metadata
+            if content.startswith("<system-reminder>"):
+                continue
+            if "LOOM_METADATA" in content or "DELIVERATOR_METADATA" in content:
+                continue
+            turn_start_idx = i
+            break
+
+        # Content array - check for text blocks
+        if isinstance(content, list):
+            has_real_text = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    # Skip hook-injected metadata
+                    if text.startswith("<system-reminder>"):
+                        continue
+                    if "LOOM_METADATA" in text or "DELIVERATOR_METADATA" in text:
+                        continue
+                    has_real_text = True
+                    break
+            if has_real_text:
+                turn_start_idx = i
+                break
+
+    if turn_start_idx is None:
+        # No turn start found - return last few messages as fallback
+        return messages[-3:] if len(messages) > 3 else messages
+
+    return messages[turn_start_idx:]
+
+
+def _format_system_instructions(system: str | list) -> str:
+    """Format system prompt as gen_ai.system_instructions.
+
+    Returns JSON string per spec: array of {"type": "text", "content": "..."}
+    """
+    if isinstance(system, str):
+        return json.dumps([{"type": "text", "content": system}])
+
+    # Already a list (cache_control blocks, etc.)
+    parts = []
+    for block in system:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append({"type": "text", "content": block.get("text", "")})
+        elif isinstance(block, str):
+            parts.append({"type": "text", "content": block})
+
+    return json.dumps(parts)
+
+
+def _format_input_messages(messages: list) -> str:
+    """Format messages as gen_ai.input.messages.
+
+    Returns JSON string per spec: array of {"role": "...", "parts": [...]}
+    """
+    formatted = []
+
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content")
+
+        parts = []
+
+        if isinstance(content, str):
+            # Skip metadata injections in the formatted output
+            if not content.startswith("<system-reminder>") and "LOOM_METADATA" not in content:
+                parts.append({"type": "text", "content": content})
+
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+
+                block_type = block.get("type")
+
+                if block_type == "text":
+                    text = block.get("text", "")
+                    # Skip metadata injections
+                    if text.startswith("<system-reminder>") or "LOOM_METADATA" in text:
+                        continue
+                    parts.append({"type": "text", "content": text})
+
+                elif block_type == "tool_use":
+                    parts.append({
+                        "type": "tool_call",
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "arguments": block.get("input", {}),
+                    })
+
+                elif block_type == "tool_result":
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, list):
+                        # Extract text from result content array
+                        texts = [
+                            item.get("text", "")
+                            for item in result_content
+                            if isinstance(item, dict) and item.get("type") == "text"
+                        ]
+                        result_content = "\n".join(texts)
+
+                    parts.append({
+                        "type": "tool_call_response",
+                        "id": block.get("tool_use_id", ""),
+                        "result": result_content[:1000] if result_content else "",
+                    })
+
+        if parts:  # Only add if there are actual parts
+            formatted.append({"role": role, "parts": parts})
+
+    return json.dumps(formatted)
+
+
+def _format_output_messages(content_blocks: list, stop_reason: str | None = None) -> str:
+    """Format response as gen_ai.output.messages.
+
+    Returns JSON string per spec: array of {"role": "assistant", "parts": [...], "finish_reason": "..."}
+    """
+    parts = []
 
     for block in content_blocks:
         if not isinstance(block, dict):
@@ -122,123 +242,18 @@ def response_attributes(body: dict[str, Any]) -> dict[str, Any]:
         block_type = block.get("type")
 
         if block_type == "text":
-            text_parts.append(block.get("text", ""))
+            parts.append({"type": "text", "content": block.get("text", "")})
 
         elif block_type == "tool_use":
-            tc_prefix = f"{prefix}.tool_calls.{tool_call_idx}.tool_call"
-            attrs[f"{tc_prefix}.id"] = block.get("id", "")
-            attrs[f"{tc_prefix}.function.name"] = block.get("name", "")
-            attrs[f"{tc_prefix}.function.arguments"] = json.dumps(block.get("input", {}))
-            tool_call_idx += 1
+            parts.append({
+                "type": "tool_call",
+                "id": block.get("id", ""),
+                "name": block.get("name", ""),
+                "arguments": block.get("input", {}),
+            })
 
-    # Set content as joined text (tool calls are in tool_calls)
-    if text_parts:
-        full_text = "\n".join(text_parts)
-        attrs[f"{prefix}.content"] = full_text
-
-        # output.value for Phoenix UI
-        attrs["output.value"] = full_text[:2000]
-        attrs["output.mime_type"] = "text/plain"
-
-    # === Stop reason ===
-    stop_reason = body.get("stop_reason")
+    message = {"role": "assistant", "parts": parts}
     if stop_reason:
-        attrs["llm.stop_reason"] = stop_reason
+        message["finish_reason"] = stop_reason
 
-    return attrs
-
-
-def _add_content_array(attrs: dict[str, Any], prefix: str, content: list) -> None:
-    """Add content array items as indexed OpenInference attributes.
-
-    Handles: text, image, tool_use, tool_result blocks.
-    """
-    # Track tool calls separately (they go in message.tool_calls, not contents)
-    tool_call_idx = 0
-    content_idx = 0
-
-    for block in content:
-        if not isinstance(block, dict):
-            # Plain string in array
-            c_prefix = f"{prefix}.contents.{content_idx}.message_content"
-            attrs[f"{c_prefix}.type"] = "text"
-            attrs[f"{c_prefix}.text"] = str(block)
-            content_idx += 1
-            continue
-
-        block_type = block.get("type")
-
-        if block_type == "text":
-            c_prefix = f"{prefix}.contents.{content_idx}.message_content"
-            attrs[f"{c_prefix}.type"] = "text"
-            attrs[f"{c_prefix}.text"] = block.get("text", "")
-            content_idx += 1
-
-        elif block_type == "image":
-            c_prefix = f"{prefix}.contents.{content_idx}.message_content"
-            attrs[f"{c_prefix}.type"] = "image"
-            # Handle both URL and base64 source types
-            source = block.get("source", {})
-            if source.get("type") == "base64":
-                media_type = source.get("media_type", "image/png")
-                data = source.get("data", "")
-                attrs[f"{c_prefix}.image.image.url"] = f"data:{media_type};base64,{data[:100]}..."
-            elif source.get("type") == "url":
-                attrs[f"{c_prefix}.image.image.url"] = source.get("url", "")
-            content_idx += 1
-
-        elif block_type == "tool_use":
-            # Tool uses in assistant messages go to tool_calls
-            tc_prefix = f"{prefix}.tool_calls.{tool_call_idx}.tool_call"
-            attrs[f"{tc_prefix}.id"] = block.get("id", "")
-            attrs[f"{tc_prefix}.function.name"] = block.get("name", "")
-            attrs[f"{tc_prefix}.function.arguments"] = json.dumps(block.get("input", {}))
-            tool_call_idx += 1
-
-        elif block_type == "tool_result":
-            # Tool results in user messages
-            c_prefix = f"{prefix}.contents.{content_idx}.message_content"
-            attrs[f"{c_prefix}.type"] = "tool_result"
-            attrs[f"{prefix}.tool_call_id"] = block.get("tool_use_id", "")
-
-            # Extract text from tool result content
-            result_content = block.get("content", "")
-            if isinstance(result_content, str):
-                attrs[f"{c_prefix}.text"] = result_content[:1000]
-            elif isinstance(result_content, list):
-                # Tool result can have its own content array
-                texts = []
-                for item in result_content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        texts.append(item.get("text", ""))
-                attrs[f"{c_prefix}.text"] = "\n".join(texts)[:1000]
-            content_idx += 1
-
-
-def _find_last_user_text(messages: list) -> str:
-    """Find the last real user text (not tool results or system injections)."""
-    for msg in reversed(messages):
-        if msg.get("role") != "user":
-            continue
-
-        content = msg.get("content")
-        if isinstance(content, str):
-            # Skip hook-injected content
-            if content.startswith("<system-reminder>"):
-                continue
-            if "LOOM_METADATA" in content or "EAVESDROP_METADATA" in content:
-                continue
-            return content
-
-        if isinstance(content, list):
-            # Find text blocks that aren't system injections
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    if text.startswith("<system-reminder>"):
-                        continue
-                    if "LOOM_METADATA" in text or "EAVESDROP_METADATA" in text:
-                        continue
-                    return text
-
-    return ""
+    return json.dumps([message])
