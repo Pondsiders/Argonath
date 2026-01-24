@@ -190,6 +190,7 @@ async def handle_request(request: Request, path: str):
     # === Extract correlation info from headers ===
     session_id = headers.get("x-session-id")
     traceparent = headers.get("traceparent")
+    loom_pattern = headers.get("x-loom-pattern")
 
     # Get parent context if traceparent provided
     parent_context = None
@@ -248,8 +249,10 @@ async def handle_request(request: Request, path: str):
     logger.info(f"Processing: model={model_name}, session={session_id[:8] if session_id else 'none'}")
 
     # === Create the LLM span (goes to Phoenix via openinference.span.kind) ===
+    # Pattern + model makes it easy to tell who's talking (alpha, iota, etc.)
+    span_prefix = f"{loom_pattern} " if loom_pattern else ""
     llm_span = tracer.start_span(
-        name=f"llm.{model_name}",
+        name=f"{span_prefix}{model_name}",
         kind=otel_trace.SpanKind.CLIENT,
         start_time=start_time_ns,
         # Parent to current context (wrapper_span)
@@ -265,6 +268,10 @@ async def handle_request(request: Request, path: str):
         # Session correlation
         if session_id:
             llm_span.set_attribute("session.id", session_id)
+
+        # Pattern identification (who's talking: alpha, iota, etc.)
+        if loom_pattern:
+            llm_span.set_attribute("loom.pattern", loom_pattern)
 
         # === Forward to Anthropic ===
         client = await get_client()
