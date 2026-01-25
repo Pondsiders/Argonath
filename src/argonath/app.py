@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import httpx
 import logfire
-from opentelemetry.propagate import extract
+from opentelemetry import trace
 
 from .attributes import request_attributes, response_attributes
 
@@ -192,13 +192,8 @@ async def handle_request(request: Request, path: str):
     headers = dict(request.headers)
 
     # === Extract correlation info from headers ===
+    # Note: traceparent is automatically handled by instrument_fastapi()
     session_id = headers.get("x-session-id")
-    traceparent = headers.get("traceparent")
-
-    # Get parent context if traceparent provided
-    parent_ctx = None
-    if traceparent:
-        parent_ctx = extract({"traceparent": traceparent})
 
     # === Determine if this is a messages endpoint ===
     is_messages = request.method == "POST" and "messages" in path
@@ -232,30 +227,21 @@ async def handle_request(request: Request, path: str):
     except json.JSONDecodeError:
         pass
 
-    # === Create span with parent context if provided ===
-    # We'll use manual span management for streaming support
+    # === Get the current span (created by instrument_fastapi) and attach gen_ai attributes ===
+    # We don't create a new span - we enrich the existing FastAPI span with LLM-specific attributes
+    current_span = trace.get_current_span()
 
-    # Prepare span attributes
-    span_attrs = {
-        "endpoint": "/v1/messages",
-    }
-    if session_id:
-        span_attrs["session.id"] = session_id[:8]
+    # Set basic attributes
+    if current_span.is_recording():
+        current_span.set_attribute("endpoint", "/v1/messages")
+        if session_id:
+            current_span.set_attribute("session.id", session_id[:8])
 
-    # Set request attributes if we parsed the body
-    if request_body:
-        req_attrs = request_attributes(request_body, session_id=session_id)
-        span_attrs.update(req_attrs)
-
-    # Create the span - attach to parent context if available
-    if parent_ctx:
-        ctx_manager = logfire.attach_context(parent_ctx)
-        ctx_manager.__enter__()
-    else:
-        ctx_manager = None
-
-    span = logfire.span("chat {model_name}", model_name=model_name, **span_attrs)
-    span.__enter__()
+        # Set gen_ai.* request attributes
+        if request_body:
+            req_attrs = request_attributes(request_body, session_id=session_id)
+            for key, value in req_attrs.items():
+                current_span.set_attribute(key, value)
 
     logfire.info("Processing request", model=model_name, session=session_id[:8] if session_id else "none")
 
@@ -276,56 +262,37 @@ async def handle_request(request: Request, path: str):
         content_type = upstream_response.headers.get("content-type", "")
         response_headers = _filter_response_headers(dict(upstream_response.headers))
 
-        span.set_attribute("http.status_code", status_code)
+        current_span.set_attribute("http.status_code", status_code)
 
         if "text/event-stream" in content_type:
             # === Streaming response ===
-            # Keep span open through streaming so response attributes get recorded.
-            # The context detach warning is harmless - we suppress it.
+            # Capture response data during streaming, then set attributes
             chunks: list[bytes] = []
 
-            # Capture for the generator
-            captured_span = span
-            captured_ctx_manager = ctx_manager
+            # Capture current span for use in the generator
+            captured_span = current_span
 
-            async def stream_with_span():
-                try:
-                    async for chunk in _stream_and_capture(upstream_response, chunks):
-                        yield chunk
+            async def stream_with_attributes():
+                async for chunk in _stream_and_capture(upstream_response, chunks):
+                    yield chunk
 
-                    # After streaming, parse and record attributes on the span
-                    response_body = _parse_sse_response(chunks)
+                # After streaming, parse and record response attributes
+                response_body = _parse_sse_response(chunks)
 
-                    if response_body:
-                        resp_attrs = response_attributes(response_body)
-                        for key, value in resp_attrs.items():
-                            captured_span.set_attribute(key, value)
+                if response_body and captured_span.is_recording():
+                    resp_attrs = response_attributes(response_body)
+                    for key, value in resp_attrs.items():
+                        captured_span.set_attribute(key, value)
 
-                    if status_code >= 400:
-                        captured_span.set_level("error")
-
-                    logfire.info(
-                        "Witnessed streaming response",
-                        model=model_name,
-                        session=session_id[:8] if session_id else "none",
-                        status=status_code,
-                    )
-
-                finally:
-                    # End the span - this records all attributes including response data
-                    # Context detach may warn about cross-context - that's expected and harmless
-                    try:
-                        captured_span.__exit__(None, None, None)
-                    except ValueError:
-                        pass  # Cross-context detach, harmless
-                    if captured_ctx_manager:
-                        try:
-                            captured_ctx_manager.__exit__(None, None, None)
-                        except ValueError:
-                            pass  # Cross-context detach, harmless
+                logfire.info(
+                    "Witnessed streaming response",
+                    model=model_name,
+                    session=session_id[:8] if session_id else "none",
+                    status=status_code,
+                )
 
             return StreamingResponse(
-                stream_with_span(),
+                stream_with_attributes(),
                 status_code=status_code,
                 headers=response_headers,
                 media_type="text/event-stream",
@@ -335,22 +302,16 @@ async def handle_request(request: Request, path: str):
             # === Non-streaming response ===
             response_content = upstream_response.content
 
-            try:
-                response_body = json.loads(response_content)
-                resp_attrs = response_attributes(response_body)
-                for key, value in resp_attrs.items():
-                    span.set_attribute(key, value)
-            except json.JSONDecodeError:
-                pass
-
-            if status_code >= 400:
-                span.set_level("error")
+            if current_span.is_recording():
+                try:
+                    response_body = json.loads(response_content)
+                    resp_attrs = response_attributes(response_body)
+                    for key, value in resp_attrs.items():
+                        current_span.set_attribute(key, value)
+                except json.JSONDecodeError:
+                    pass
 
             logfire.info("Witnessed response", model=model_name, session=session_id[:8] if session_id else "none", status=status_code)
-
-            span.__exit__(None, None, None)
-            if ctx_manager:
-                ctx_manager.__exit__(None, None, None)
 
             return Response(
                 content=response_content,
@@ -359,10 +320,6 @@ async def handle_request(request: Request, path: str):
             )
 
     except Exception as e:
-        span.record_exception(e)
-        span.set_level("error")
-        span.__exit__(*sys.exc_info())
-        if ctx_manager:
-            ctx_manager.__exit__(*sys.exc_info())
+        current_span.record_exception(e)
         logfire.error("Argonath error", error=str(e))
         raise
