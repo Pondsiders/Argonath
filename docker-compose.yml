@@ -7,9 +7,8 @@ services:
       - "8083:8081"
     environment:
       - ANTHROPIC_API_URL=https://api.anthropic.com
-      - OTEL_EXPORTER_OTLP_ENDPOINT=http://alpha-pi:4318
-      - OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-      - OTEL_SERVICE_NAME=argonath
+      - LOGFIRE_TOKEN=${LOGFIRE_TOKEN}
+      - OTEL_SERVICE_NAME=argonath-greatloom
     restart: unless-stopped
     dns:
       - ${TAILSCALE_DNS}
