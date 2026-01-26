@@ -1,113 +1,34 @@
-"""Attribute extraction from Anthropic API requests/responses.
+"""gen_ai.* attribute extraction from Anthropic API requests/responses.
 
-Emits gen_ai.* semantic conventions for Logfire LLM observability.
+Follows OpenTelemetry Semantic Conventions for GenAI:
+https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md
+
+Key design decisions:
+- System prompt goes in gen_ai.system_instructions (separate from input.messages)
+- gen_ai.input.messages contains the current TURN only (from last user text message onward)
+- Turn boundary = user message with text content (not tool_result)
 """
 
 import json
 from typing import Any
 
 
-def _anthropic_content_to_gen_ai_parts(content: Any) -> list[dict]:
-    """Convert Anthropic content to gen_ai parts format.
-
-    gen_ai format: [{"type": "text", "content": "..."}, {"type": "tool_call", ...}]
-    """
-    if isinstance(content, str):
-        return [{"type": "text", "content": content}]
-
-    if not isinstance(content, list):
-        return []
-
-    parts = []
-    for block in content:
-        if isinstance(block, str):
-            parts.append({"type": "text", "content": block})
-        elif isinstance(block, dict):
-            block_type = block.get("type")
-
-            if block_type == "text":
-                parts.append({"type": "text", "content": block.get("text", "")})
-
-            elif block_type == "tool_use":
-                parts.append({
-                    "type": "tool_call",
-                    "id": block.get("id", ""),
-                    "name": block.get("name", ""),
-                    "arguments": block.get("input", {})
-                })
-
-            elif block_type == "tool_result":
-                result_content = block.get("content", "")
-                if isinstance(result_content, list):
-                    # Extract text from nested content
-                    texts = [item.get("text", "") for item in result_content
-                             if isinstance(item, dict) and item.get("type") == "text"]
-                    result_content = "\n".join(texts)
-                parts.append({
-                    "type": "tool_call_response",
-                    "id": block.get("tool_use_id", ""),
-                    "result": result_content[:2000] if isinstance(result_content, str) else str(result_content)[:2000]
-                })
-
-            elif block_type == "image":
-                # Note image presence without embedding data
-                parts.append({"type": "image", "content": "[image]"})
-
-    return parts
-
-
-def _anthropic_system_to_gen_ai(system: Any) -> list[dict]:
-    """Convert Anthropic system prompt to gen_ai system_instructions format."""
-    if isinstance(system, str):
-        return [{"type": "text", "content": system}]
-
-    if isinstance(system, list):
-        instructions = []
-        for block in system:
-            if isinstance(block, dict) and block.get("type") == "text":
-                instructions.append({"type": "text", "content": block.get("text", "")})
-            elif isinstance(block, str):
-                instructions.append({"type": "text", "content": block})
-        return instructions
-
-    return []
-
-
-def _anthropic_tools_to_gen_ai(tools: list) -> list[dict]:
-    """Convert Anthropic tools to gen_ai tool_definitions format."""
-    definitions = []
-    for tool in tools:
-        definitions.append({
-            "type": "function",
-            "name": tool.get("name", ""),
-            "description": tool.get("description", ""),
-            "parameters": tool.get("input_schema", {})
-        })
-    return definitions
-
-
-def _is_tool_result_message(content: Any) -> bool:
-    """Check if message content is a tool result."""
-    if isinstance(content, list):
-        return any(
-            isinstance(block, dict) and block.get("type") == "tool_result"
-            for block in content
-        )
-    return False
-
-
-def request_attributes(body: dict[str, Any]) -> dict[str, Any]:
+def request_attributes(body: dict[str, Any], session_id: str | None = None) -> dict[str, Any]:
     """Extract gen_ai.* attributes from an Anthropic Messages API request."""
     attrs: dict[str, Any] = {}
 
     model = body.get("model", "unknown")
 
-    # === gen_ai.* semantic conventions ===
+    # === Required attributes ===
     attrs["gen_ai.operation.name"] = "chat"
     attrs["gen_ai.provider.name"] = "anthropic"
     attrs["gen_ai.request.model"] = model
 
-    # Request parameters
+    # === Conditionally required ===
+    if session_id:
+        attrs["gen_ai.conversation.id"] = session_id
+
+    # === Recommended request parameters ===
     if "max_tokens" in body:
         attrs["gen_ai.request.max_tokens"] = body["max_tokens"]
     if "temperature" in body:
@@ -119,28 +40,16 @@ def request_attributes(body: dict[str, Any]) -> dict[str, Any]:
     if "stop_sequences" in body:
         attrs["gen_ai.request.stop_sequences"] = body["stop_sequences"]
 
-    # System instructions - full computed system prompt
+    # === System instructions (separate from input.messages) ===
     system = body.get("system")
     if system:
-        attrs["gen_ai.system_instructions"] = json.dumps(_anthropic_system_to_gen_ai(system))
+        attrs["gen_ai.system_instructions"] = _format_system_instructions(system)
 
-    # Input messages - CURRENT TURN ONLY (last user message)
-    # Each trace captures one API call. If you want full history, look at previous traces.
+    # === Input messages (current turn only) ===
     messages = body.get("messages", [])
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content")
-            if not _is_tool_result_message(content):
-                attrs["gen_ai.input.messages"] = json.dumps([{
-                    "role": "user",
-                    "parts": _anthropic_content_to_gen_ai_parts(content)
-                }])
-                break
-
-    # Tool definitions - full schemas
-    tools = body.get("tools", [])
-    if tools:
-        attrs["gen_ai.tool.definitions"] = json.dumps(_anthropic_tools_to_gen_ai(tools))
+    turn_messages = _extract_current_turn(messages)
+    if turn_messages:
+        attrs["gen_ai.input.messages"] = _format_input_messages(turn_messages)
 
     return attrs
 
@@ -149,47 +58,216 @@ def response_attributes(body: dict[str, Any]) -> dict[str, Any]:
     """Extract gen_ai.* attributes from an Anthropic Messages API response."""
     attrs: dict[str, Any] = {}
 
-    # Token counts
+    # === Usage ===
     usage = body.get("usage", {})
     input_tokens = usage.get("input_tokens", 0)
     output_tokens = usage.get("output_tokens", 0)
 
-    # gen_ai.* semantic conventions
-    attrs["gen_ai.usage.input_tokens"] = input_tokens
-    attrs["gen_ai.usage.output_tokens"] = output_tokens
+    if input_tokens:
+        attrs["gen_ai.usage.input_tokens"] = input_tokens
+    if output_tokens:
+        attrs["gen_ai.usage.output_tokens"] = output_tokens
 
-    # llm.token_count.* (for Phoenix/OpenInference and Logfire list view display)
-    attrs["llm.token_count.prompt"] = input_tokens
-    attrs["llm.token_count.completion"] = output_tokens
-    attrs["llm.token_count.total"] = input_tokens + output_tokens
-
-    # Response identification
+    # === Response metadata ===
     if "id" in body:
         attrs["gen_ai.response.id"] = body["id"]
     if "model" in body:
         attrs["gen_ai.response.model"] = body["model"]
 
-    # Cache metrics (Anthropic-specific, but useful)
-    cache_read = usage.get("cache_read_input_tokens", 0)
-    cache_write = usage.get("cache_creation_input_tokens", 0)
-    if cache_read:
-        attrs["gen_ai.anthropic.cache_read_tokens"] = cache_read
-    if cache_write:
-        attrs["gen_ai.anthropic.cache_write_tokens"] = cache_write
-
-    # Stop reason
+    # === Finish reason ===
     stop_reason = body.get("stop_reason")
     if stop_reason:
         attrs["gen_ai.response.finish_reasons"] = [stop_reason]
 
-    # Output messages
+    # === Output type ===
     content_blocks = body.get("content", [])
-    output_parts = _anthropic_content_to_gen_ai_parts(content_blocks)
-    if output_parts:
-        attrs["gen_ai.output.messages"] = json.dumps([{
-            "role": "assistant",
-            "parts": output_parts,
-            "finish_reason": stop_reason or "stop"
-        }])
+    has_text = any(b.get("type") == "text" for b in content_blocks if isinstance(b, dict))
+    has_tool = any(b.get("type") == "tool_use" for b in content_blocks if isinstance(b, dict))
+
+    if has_tool:
+        attrs["gen_ai.output.type"] = "json"  # Tool calls are structured
+    elif has_text:
+        attrs["gen_ai.output.type"] = "text"
+
+    # === Output messages ===
+    if content_blocks:
+        attrs["gen_ai.output.messages"] = _format_output_messages(content_blocks, stop_reason)
 
     return attrs
+
+
+def _extract_current_turn(messages: list) -> list:
+    """Extract the current turn from the message history.
+
+    A turn starts with the FIRST message in a contiguous sequence of user TEXT
+    messages at the end of the conversation. This handles memory injection where
+    multiple text blocks are appended after the user's actual prompt.
+
+    Example: [assistant] [user_text: prompt] [user_text: memory1] [user_text: memory2]
+    Returns all three user messages, not just the last one.
+    """
+
+    def is_user_text_message(msg: dict) -> bool:
+        """Check if a message is a user message with real text content."""
+        if msg.get("role") != "user":
+            return False
+
+        content = msg.get("content")
+
+        # Plain text message
+        if isinstance(content, str):
+            # Skip hook-injected metadata
+            if content.startswith("<system-reminder>"):
+                return False
+            if "LOOM_METADATA" in content or "DELIVERATOR_METADATA" in content:
+                return False
+            return True
+
+        # Content array - check for text blocks
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = block.get("text", "")
+                    # Skip hook-injected metadata
+                    if text.startswith("<system-reminder>"):
+                        continue
+                    if "LOOM_METADATA" in text or "DELIVERATOR_METADATA" in text:
+                        continue
+                    return True
+
+        return False
+
+    # Scan backwards to find the start of the user text message sequence
+    # First, find any user text message
+    # Then keep going backwards while we still find user text messages
+    # The turn starts at the first message of that sequence
+
+    turn_start_idx = None
+
+    for i in range(len(messages) - 1, -1, -1):
+        if is_user_text_message(messages[i]):
+            turn_start_idx = i
+            # Keep scanning backwards to find the START of the sequence
+        elif turn_start_idx is not None:
+            # We found a non-user-text message, so the sequence ended
+            # turn_start_idx is already pointing to the first message of the sequence
+            break
+
+    if turn_start_idx is None:
+        # No turn start found - return last few messages as fallback
+        return messages[-3:] if len(messages) > 3 else messages
+
+    return messages[turn_start_idx:]
+
+
+def _format_system_instructions(system: str | list) -> str:
+    """Format system prompt as gen_ai.system_instructions.
+
+    Returns JSON string per spec: array of {"type": "text", "content": "..."}
+    """
+    if isinstance(system, str):
+        return json.dumps([{"type": "text", "content": system}])
+
+    # Already a list (cache_control blocks, etc.)
+    parts = []
+    for block in system:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append({"type": "text", "content": block.get("text", "")})
+        elif isinstance(block, str):
+            parts.append({"type": "text", "content": block})
+
+    return json.dumps(parts)
+
+
+def _format_input_messages(messages: list) -> str:
+    """Format messages as gen_ai.input.messages.
+
+    Returns JSON string per spec: array of {"role": "...", "parts": [...]}
+    """
+    formatted = []
+
+    for msg in messages:
+        role = msg.get("role", "unknown")
+        content = msg.get("content")
+
+        parts = []
+
+        if isinstance(content, str):
+            # Skip metadata injections in the formatted output
+            if not content.startswith("<system-reminder>") and "LOOM_METADATA" not in content:
+                parts.append({"type": "text", "content": content})
+
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+
+                block_type = block.get("type")
+
+                if block_type == "text":
+                    text = block.get("text", "")
+                    # Skip metadata injections
+                    if text.startswith("<system-reminder>") or "LOOM_METADATA" in text:
+                        continue
+                    parts.append({"type": "text", "content": text})
+
+                elif block_type == "tool_use":
+                    parts.append({
+                        "type": "tool_call",
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "arguments": block.get("input", {}),
+                    })
+
+                elif block_type == "tool_result":
+                    result_content = block.get("content", "")
+                    if isinstance(result_content, list):
+                        # Extract text from result content array
+                        texts = [
+                            item.get("text", "")
+                            for item in result_content
+                            if isinstance(item, dict) and item.get("type") == "text"
+                        ]
+                        result_content = "\n".join(texts)
+
+                    parts.append({
+                        "type": "tool_call_response",
+                        "id": block.get("tool_use_id", ""),
+                        "result": result_content[:1000] if result_content else "",
+                    })
+
+        if parts:  # Only add if there are actual parts
+            formatted.append({"role": role, "parts": parts})
+
+    return json.dumps(formatted)
+
+
+def _format_output_messages(content_blocks: list, stop_reason: str | None = None) -> str:
+    """Format response as gen_ai.output.messages.
+
+    Returns JSON string per spec: array of {"role": "assistant", "parts": [...], "finish_reason": "..."}
+    """
+    parts = []
+
+    for block in content_blocks:
+        if not isinstance(block, dict):
+            continue
+
+        block_type = block.get("type")
+
+        if block_type == "text":
+            parts.append({"type": "text", "content": block.get("text", "")})
+
+        elif block_type == "tool_use":
+            parts.append({
+                "type": "tool_call",
+                "id": block.get("id", ""),
+                "name": block.get("name", ""),
+                "arguments": block.get("input", {}),
+            })
+
+    message = {"role": "assistant", "parts": parts}
+    if stop_reason:
+        message["finish_reason"] = stop_reason
+
+    return json.dumps([message])

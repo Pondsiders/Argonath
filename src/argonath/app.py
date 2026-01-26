@@ -7,25 +7,26 @@ No transformation, just watching.
 import json
 import logging
 import os
+import sys
 import time
+
+# Suppress the harmless "Failed to detach context" warnings from OTel BEFORE importing
+# These occur when spans cross async generator boundaries - expected behavior
+logging.getLogger("opentelemetry.context").setLevel(logging.CRITICAL)
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import httpx
-
-from pondside.telemetry import init, get_tracer
-from opentelemetry import trace as otel_trace
-from opentelemetry.context import attach, detach
-from opentelemetry.trace import Status, StatusCode, set_span_in_context
-from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+import logfire
+from opentelemetry import trace
 
 from .attributes import request_attributes, response_attributes
 
-# Initialize telemetry
-init("argonath")
-
-logger = logging.getLogger(__name__)
-tracer = get_tracer()
+# Initialize Logfire
+# Scrubbing disabled - too aggressive (redacts "session", "auth", etc.)
+# Our logs are authenticated with 30-day retention; acceptable risk for debugging visibility
+logfire.configure(distributed_tracing=True, scrubbing=False)
+logfire.instrument_httpx()
 
 ANTHROPIC_API_URL = os.environ.get("ANTHROPIC_API_URL", "https://api.anthropic.com")
 
@@ -57,6 +58,9 @@ app = FastAPI(
     description="Everything that passes through the Gates is witnessed.",
 )
 
+# Instrument FastAPI with Logfire
+logfire.instrument_fastapi(app)
+
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -65,7 +69,6 @@ async def shutdown():
 
 def _filter_request_headers(headers: dict) -> dict:
     """Filter headers for forwarding to Anthropic."""
-    # Headers to forward
     forward = {}
     for key, value in headers.items():
         key_lower = key.lower()
@@ -78,6 +81,7 @@ def _filter_request_headers(headers: dict) -> dict:
         if key_lower in ("x-session-id", "traceparent", "tracestate"):
             continue
         forward[key] = value
+    logfire.debug("Forwarding headers", headers=list(forward.keys()))
     return forward
 
 
@@ -188,15 +192,8 @@ async def handle_request(request: Request, path: str):
     headers = dict(request.headers)
 
     # === Extract correlation info from headers ===
+    # Note: traceparent is automatically handled by instrument_fastapi()
     session_id = headers.get("x-session-id")
-    traceparent = headers.get("traceparent")
-    loom_pattern = headers.get("x-loom-pattern")
-
-    # Get parent context if traceparent provided
-    parent_context = None
-    if traceparent:
-        carrier = {"traceparent": traceparent}
-        parent_context = TraceContextTextMapPropagator().extract(carrier=carrier)
 
     # === Determine if this is a messages endpoint ===
     is_messages = request.method == "POST" and "messages" in path
@@ -230,49 +227,25 @@ async def handle_request(request: Request, path: str):
     except json.JSONDecodeError:
         pass
 
-    # === Create wrapper span for infrastructure visibility ===
-    # This span is parented to the incoming traceparent and goes to Logfire
-    # (no openinference.span.kind attribute). All log messages inside it
-    # will be properly parented. The LLM span is created separately inside.
-    wrapper_span = tracer.start_span(
-        "argonath: /v1/messages",
-        context=parent_context,
-    )
-    wrapper_span.set_attribute("model", model_name)
-    if session_id:
-        wrapper_span.set_attribute("session.id", session_id[:8])
+    # === Get the current span (created by instrument_fastapi) and attach gen_ai attributes ===
+    # We don't create a new span - we enrich the existing FastAPI span with LLM-specific attributes
+    current_span = trace.get_current_span()
 
-    # Make wrapper span the current context so logs are parented to it
-    wrapper_context = set_span_in_context(wrapper_span)
-    wrapper_token = attach(wrapper_context)
+    # Set basic attributes
+    if current_span.is_recording():
+        current_span.set_attribute("endpoint", "/v1/messages")
+        if session_id:
+            current_span.set_attribute("session.id", session_id[:8])
 
-    logger.info(f"Processing: model={model_name}, session={session_id[:8] if session_id else 'none'}")
+        # Set gen_ai.* request attributes
+        if request_body:
+            req_attrs = request_attributes(request_body, session_id=session_id)
+            for key, value in req_attrs.items():
+                current_span.set_attribute(key, value)
 
-    # === Create the LLM span (goes to Phoenix via openinference.span.kind) ===
-    # Pattern + model makes it easy to tell who's talking (alpha, iota, etc.)
-    span_prefix = f"{loom_pattern} " if loom_pattern else ""
-    llm_span = tracer.start_span(
-        name=f"{span_prefix}{model_name}",
-        kind=otel_trace.SpanKind.CLIENT,
-        start_time=start_time_ns,
-        # Parent to current context (wrapper_span)
-    )
+    logfire.info("Processing request", model=model_name, session=session_id[:8] if session_id else "none")
 
     try:
-        # Set request attributes on LLM span
-        if request_body:
-            req_attrs = request_attributes(request_body)
-            for key, value in req_attrs.items():
-                llm_span.set_attribute(key, value)
-
-        # Session correlation
-        if session_id:
-            llm_span.set_attribute("session.id", session_id)
-
-        # Pattern identification (who's talking: alpha, iota, etc.)
-        if loom_pattern:
-            llm_span.set_attribute("loom.pattern", loom_pattern)
-
         # === Forward to Anthropic ===
         client = await get_client()
         forward_headers = _filter_request_headers(headers)
@@ -289,55 +262,37 @@ async def handle_request(request: Request, path: str):
         content_type = upstream_response.headers.get("content-type", "")
         response_headers = _filter_response_headers(dict(upstream_response.headers))
 
-        llm_span.set_attribute("http.status_code", status_code)
-        wrapper_span.set_attribute("http.status_code", status_code)
+        current_span.set_attribute("http.status_code", status_code)
 
         if "text/event-stream" in content_type:
             # === Streaming response ===
+            # Capture response data during streaming, then set attributes
             chunks: list[bytes] = []
 
-            # Capture context for the generator
-            captured_wrapper_token = wrapper_token
-            captured_wrapper_context = wrapper_context
+            # Capture current span for use in the generator
+            captured_span = current_span
 
-            async def stream_with_span():
-                # Re-attach context for the generator
-                stream_token = attach(captured_wrapper_context)
-                try:
-                    async for chunk in _stream_and_capture(upstream_response, chunks):
-                        yield chunk
+            async def stream_with_attributes():
+                async for chunk in _stream_and_capture(upstream_response, chunks):
+                    yield chunk
 
-                    # After streaming, parse and record attributes
-                    response_body = _parse_sse_response(chunks)
+                # After streaming, parse and record response attributes
+                response_body = _parse_sse_response(chunks)
 
-                    if response_body:
-                        resp_attrs = response_attributes(response_body)
-                        for key, value in resp_attrs.items():
-                            llm_span.set_attribute(key, value)
+                if response_body and captured_span.is_recording():
+                    resp_attrs = response_attributes(response_body)
+                    for key, value in resp_attrs.items():
+                        captured_span.set_attribute(key, value)
 
-                    if status_code >= 400:
-                        llm_span.set_status(Status(StatusCode.ERROR, f"HTTP {status_code}"))
-                        wrapper_span.set_status(Status(StatusCode.ERROR, f"HTTP {status_code}"))
-                    else:
-                        llm_span.set_status(Status(StatusCode.OK))
-                        wrapper_span.set_status(Status(StatusCode.OK))
+                logfire.info(
+                    "Witnessed streaming response",
+                    model=model_name,
+                    session=session_id[:8] if session_id else "none",
+                    status=status_code,
+                )
 
-                    logger.info(f"Witnessed: model={model_name}, session={session_id[:8] if session_id else 'none'}, status={status_code}")
-
-                finally:
-                    llm_span.end()
-                    wrapper_span.end()
-                    try:
-                        detach(stream_token)
-                    except ValueError:
-                        pass  # Cross-context detach, harmless
-                    # Don't detach captured_wrapper_token here - it belongs to the
-                    # original request context which is gone by streaming time.
-                    # Attempting to detach it causes ValueError spam in logs.
-
-            # Return streaming response - generator handles span cleanup
             return StreamingResponse(
-                stream_with_span(),
+                stream_with_attributes(),
                 status_code=status_code,
                 headers=response_headers,
                 media_type="text/event-stream",
@@ -347,26 +302,16 @@ async def handle_request(request: Request, path: str):
             # === Non-streaming response ===
             response_content = upstream_response.content
 
-            try:
-                response_body = json.loads(response_content)
-                resp_attrs = response_attributes(response_body)
-                for key, value in resp_attrs.items():
-                    llm_span.set_attribute(key, value)
-            except json.JSONDecodeError:
-                pass
+            if current_span.is_recording():
+                try:
+                    response_body = json.loads(response_content)
+                    resp_attrs = response_attributes(response_body)
+                    for key, value in resp_attrs.items():
+                        current_span.set_attribute(key, value)
+                except json.JSONDecodeError:
+                    pass
 
-            if status_code >= 400:
-                llm_span.set_status(Status(StatusCode.ERROR, f"HTTP {status_code}"))
-                wrapper_span.set_status(Status(StatusCode.ERROR, f"HTTP {status_code}"))
-            else:
-                llm_span.set_status(Status(StatusCode.OK))
-                wrapper_span.set_status(Status(StatusCode.OK))
-
-            logger.info(f"Witnessed: model={model_name}, session={session_id[:8] if session_id else 'none'}, status={status_code}")
-
-            llm_span.end()
-            wrapper_span.end()
-            detach(wrapper_token)
+            logfire.info("Witnessed response", model=model_name, session=session_id[:8] if session_id else "none", status=status_code)
 
             return Response(
                 content=response_content,
@@ -375,12 +320,6 @@ async def handle_request(request: Request, path: str):
             )
 
     except Exception as e:
-        llm_span.record_exception(e)
-        llm_span.set_status(Status(StatusCode.ERROR, str(e)))
-        llm_span.end()
-        wrapper_span.record_exception(e)
-        wrapper_span.set_status(Status(StatusCode.ERROR, str(e)))
-        wrapper_span.end()
-        detach(wrapper_token)
-        logger.error(f"Argonath error: {e}")
+        current_span.record_exception(e)
+        logfire.error("Argonath error", error=str(e))
         raise
