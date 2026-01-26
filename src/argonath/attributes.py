@@ -99,16 +99,18 @@ def response_attributes(body: dict[str, Any]) -> dict[str, Any]:
 def _extract_current_turn(messages: list) -> list:
     """Extract the current turn from the message history.
 
-    A turn starts with a user TEXT message (not just tool_result).
-    Returns everything from that message to the end.
-    """
-    turn_start_idx = None
+    A turn starts with the FIRST message in a contiguous sequence of user TEXT
+    messages at the end of the conversation. This handles memory injection where
+    multiple text blocks are appended after the user's actual prompt.
 
-    # Scan backwards to find the last user text message
-    for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
+    Example: [assistant] [user_text: prompt] [user_text: memory1] [user_text: memory2]
+    Returns all three user messages, not just the last one.
+    """
+
+    def is_user_text_message(msg: dict) -> bool:
+        """Check if a message is a user message with real text content."""
         if msg.get("role") != "user":
-            continue
+            return False
 
         content = msg.get("content")
 
@@ -116,15 +118,13 @@ def _extract_current_turn(messages: list) -> list:
         if isinstance(content, str):
             # Skip hook-injected metadata
             if content.startswith("<system-reminder>"):
-                continue
+                return False
             if "LOOM_METADATA" in content or "DELIVERATOR_METADATA" in content:
-                continue
-            turn_start_idx = i
-            break
+                return False
+            return True
 
         # Content array - check for text blocks
         if isinstance(content, list):
-            has_real_text = False
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "text":
                     text = block.get("text", "")
@@ -133,11 +133,25 @@ def _extract_current_turn(messages: list) -> list:
                         continue
                     if "LOOM_METADATA" in text or "DELIVERATOR_METADATA" in text:
                         continue
-                    has_real_text = True
-                    break
-            if has_real_text:
-                turn_start_idx = i
-                break
+                    return True
+
+        return False
+
+    # Scan backwards to find the start of the user text message sequence
+    # First, find any user text message
+    # Then keep going backwards while we still find user text messages
+    # The turn starts at the first message of that sequence
+
+    turn_start_idx = None
+
+    for i in range(len(messages) - 1, -1, -1):
+        if is_user_text_message(messages[i]):
+            turn_start_idx = i
+            # Keep scanning backwards to find the START of the sequence
+        elif turn_start_idx is not None:
+            # We found a non-user-text message, so the sequence ended
+            # turn_start_idx is already pointing to the first message of the sequence
+            break
 
     if turn_start_idx is None:
         # No turn start found - return last few messages as fallback
