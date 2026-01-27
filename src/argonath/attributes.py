@@ -99,65 +99,42 @@ def response_attributes(body: dict[str, Any]) -> dict[str, Any]:
 def _extract_current_turn(messages: list) -> list:
     """Extract the current turn from the message history.
 
-    A turn starts with the FIRST message in a contiguous sequence of user TEXT
-    messages at the end of the conversation. This handles memory injection where
-    multiple text blocks are appended after the user's actual prompt.
+    Returns:
+    1. ALWAYS message[0] (CLAUDE.md from SDK) — this is crucial context
+    2. Everything after the last assistant message (all user messages with
+       system-reminders, prompts, memories, Intro memorables)
 
-    Example: [assistant] [user_text: prompt] [user_text: memory1] [user_text: memory2]
-    Returns all three user messages, not just the last one.
+    This captures:
+    - The SDK boilerplate that shapes behavior
+    - All system-reminders injected by hooks
+    - The user's actual prompt
+    - Injected memories
+    - Intro's memorables
     """
+    if not messages:
+        return []
 
-    def is_user_text_message(msg: dict) -> bool:
-        """Check if a message is a user message with real text content."""
-        if msg.get("role") != "user":
-            return False
+    result = []
 
-        content = msg.get("content")
+    # Always include message[0] — that's CLAUDE.md from the SDK
+    if messages:
+        result.append(messages[0])
 
-        # Plain text message
-        if isinstance(content, str):
-            # Skip hook-injected metadata
-            if content.startswith("<system-reminder>"):
-                return False
-            if "LOOM_METADATA" in content or "DELIVERATOR_METADATA" in content:
-                return False
-            return True
-
-        # Content array - check for text blocks
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text = block.get("text", "")
-                    # Skip hook-injected metadata
-                    if text.startswith("<system-reminder>"):
-                        continue
-                    if "LOOM_METADATA" in text or "DELIVERATOR_METADATA" in text:
-                        continue
-                    return True
-
-        return False
-
-    # Scan backwards to find the start of the user text message sequence
-    # First, find any user text message
-    # Then keep going backwards while we still find user text messages
-    # The turn starts at the first message of that sequence
-
-    turn_start_idx = None
-
+    # Find the last assistant message
+    last_assistant_idx = None
     for i in range(len(messages) - 1, -1, -1):
-        if is_user_text_message(messages[i]):
-            turn_start_idx = i
-            # Keep scanning backwards to find the START of the sequence
-        elif turn_start_idx is not None:
-            # We found a non-user-text message, so the sequence ended
-            # turn_start_idx is already pointing to the first message of the sequence
+        if messages[i].get("role") == "assistant":
+            last_assistant_idx = i
             break
 
-    if turn_start_idx is None:
-        # No turn start found - return last few messages as fallback
-        return messages[-3:] if len(messages) > 3 else messages
+    # Include everything after the last assistant message
+    if last_assistant_idx is not None:
+        result.extend(messages[last_assistant_idx + 1:])
+    elif len(messages) > 1:
+        # No assistant message found — include everything except [0] (already added)
+        result.extend(messages[1:])
 
-    return messages[turn_start_idx:]
+    return result
 
 
 def _format_system_instructions(system: str | list) -> str:
@@ -193,9 +170,7 @@ def _format_input_messages(messages: list) -> str:
         parts = []
 
         if isinstance(content, str):
-            # Skip metadata injections in the formatted output
-            if not content.startswith("<system-reminder>") and "LOOM_METADATA" not in content:
-                parts.append({"type": "text", "content": content})
+            parts.append({"type": "text", "content": content})
 
         elif isinstance(content, list):
             for block in content:
@@ -206,9 +181,6 @@ def _format_input_messages(messages: list) -> str:
 
                 if block_type == "text":
                     text = block.get("text", "")
-                    # Skip metadata injections
-                    if text.startswith("<system-reminder>") or "LOOM_METADATA" in text:
-                        continue
                     parts.append({"type": "text", "content": text})
 
                 elif block_type == "tool_use":
