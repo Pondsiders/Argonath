@@ -255,31 +255,33 @@ async def handle_request(request: Request, path: str):
         client = await get_client()
         forward_headers = _filter_request_headers(headers)
 
-        upstream_response = await client.request(
-            method=request.method,
-            url=f"/{path}",
-            headers=forward_headers,
-            content=body_bytes,
-            params=dict(request.query_params),
-        )
+        # Check if this is a streaming request (stream: true in body)
+        is_streaming_request = request_body and request_body.get("stream", False)
 
-        status_code = upstream_response.status_code
-        content_type = upstream_response.headers.get("content-type", "")
-        response_headers = _filter_response_headers(dict(upstream_response.headers))
+        if is_streaming_request:
+            # === Streaming request - use client.stream() for true streaming ===
+            # client.stream() returns a context manager that doesn't buffer
 
-        current_span.set_attribute("http.status_code", status_code)
-
-        if "text/event-stream" in content_type:
-            # === Streaming response ===
-            # Capture response data during streaming, then set attributes
+            # We need to handle this differently because the response
+            # is consumed inside the async generator, not here
             chunks: list[bytes] = []
-
-            # Capture current span for use in the generator
             captured_span = current_span
 
             async def stream_with_attributes():
-                async for chunk in _stream_and_capture(upstream_response, chunks):
-                    yield chunk
+                async with client.stream(
+                    method=request.method,
+                    url=f"/{path}",
+                    headers=forward_headers,
+                    content=body_bytes,
+                    params=dict(request.query_params),
+                ) as upstream_response:
+                    # Yield headers info first (for status code)
+                    status_code = upstream_response.status_code
+                    captured_span.set_attribute("http.status_code", status_code)
+
+                    async for chunk in upstream_response.aiter_bytes():
+                        chunks.append(chunk)
+                        yield chunk
 
                 # After streaming, parse and record response attributes
                 response_body = _parse_sse_response(chunks)
@@ -293,19 +295,37 @@ async def handle_request(request: Request, path: str):
                     "Witnessed streaming response",
                     model=model_name,
                     session=session_id[:8] if session_id else "none",
-                    status=status_code,
                 )
 
+            # For streaming, we return 200 and let the stream carry the actual status
+            # (SSE doesn't really use HTTP status codes for errors mid-stream)
             return StreamingResponse(
                 stream_with_attributes(),
-                status_code=status_code,
-                headers=response_headers,
+                status_code=200,
+                headers={
+                    "content-type": "text/event-stream",
+                    "cache-control": "no-cache",
+                    "connection": "keep-alive",
+                    "x-accel-buffering": "no",  # Disable nginx buffering
+                },
                 media_type="text/event-stream",
             )
 
         else:
-            # === Non-streaming response ===
+            # === Non-streaming request - use client.request() (buffers, that's fine) ===
+            upstream_response = await client.request(
+                method=request.method,
+                url=f"/{path}",
+                headers=forward_headers,
+                content=body_bytes,
+                params=dict(request.query_params),
+            )
+
+            status_code = upstream_response.status_code
+            response_headers = _filter_response_headers(dict(upstream_response.headers))
             response_content = upstream_response.content
+
+            current_span.set_attribute("http.status_code", status_code)
 
             if current_span.is_recording():
                 try:
