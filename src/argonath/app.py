@@ -9,6 +9,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 
 # Suppress the harmless "Failed to detach context" warnings from OTel BEFORE importing
 # These occur when spans cross async generator boundaries - expected behavior
@@ -34,6 +35,11 @@ logging.basicConfig(handlers=[logfire.LogfireLoggingHandler()], level=logging.IN
 logfire.instrument_httpx()
 
 ANTHROPIC_API_URL = os.environ.get("ANTHROPIC_API_URL", "https://api.anthropic.com")
+
+# Debug capture mode - when x-alpha-debug: capture header is present,
+# dump full request body to file for debugging compact rewriting
+DEBUG_CAPTURE_HEADER = "x-alpha-debug"
+CAPTURE_DIR = Path("/Pondside/Basement/Argonath/captures")
 
 # Reusable HTTP client
 _client: httpx.AsyncClient | None = None
@@ -199,6 +205,35 @@ async def handle_request(request: Request, path: str):
     # === Extract correlation info from headers ===
     # Note: traceparent is automatically handled by instrument_fastapi()
     session_id = headers.get("x-session-id")
+
+    # === Debug capture mode ===
+    # When x-alpha-debug: capture header is present, dump request to file
+    if headers.get(DEBUG_CAPTURE_HEADER) == "capture":
+        try:
+            CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+            # Timestamp with nanosecond suffix for uniqueness
+            timestamp = time.strftime("%Y%m%d-%H%M%S") + f"-{time.time_ns() % 1000000:06d}"
+            capture_path = CAPTURE_DIR / f"{timestamp}.json"
+
+            capture_data = {
+                "timestamp": timestamp,
+                "path": path,
+                "method": request.method,
+                "headers": {k: v for k, v in headers.items() if not k.startswith("authorization")},
+            }
+
+            # Try to parse body as JSON for pretty output
+            try:
+                capture_data["body"] = json.loads(body_bytes)
+            except json.JSONDecodeError:
+                capture_data["body_raw"] = body_bytes.decode("utf-8", errors="replace")
+
+            with open(capture_path, "w") as f:
+                json.dump(capture_data, f, indent=2)
+
+            logfire.info("Debug capture", path=str(capture_path))
+        except Exception as e:
+            logfire.warning("Debug capture failed", error=str(e))
 
     # === Determine if this is a messages endpoint ===
     is_messages = request.method == "POST" and "messages" in path
